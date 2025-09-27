@@ -477,6 +477,305 @@ class LongCatQuantizer:
         self.logger.info("All tasks completed successfully.")
 
 
+def quantize_model_mixed_precision(
+    model,
+    calibration_loader,
+    memory_budget_mb: float,
+    logger: Optional[logging.Logger] = None,
+    max_calib_batches: int = 5,
+) -> "object":
+    """Entropy-driven, memory-constrained mixed-precision quantization.
+
+    Quantizes nn.Linear and nn.Conv2d layers to 4/8/16-bit based on activation entropy
+    sensitivity under a total memory budget (in MB). The returned model uses lightweight
+    wrappers that dequantize per-layer weights on-the-fly for inference.
+
+    Args:
+        model: A torch.nn.Module to be quantized (will be modified in-place).
+        calibration_loader: DataLoader yielding batches; only the first element is used as input.
+        memory_budget_mb: Target model size budget in megabytes.
+        logger: Optional logger for progress output; a basic one is created if None.
+        max_calib_batches: Limit on number of calibration batches to process.
+
+    Returns:
+        The quantized model (same instance) with mixed-precision wrappers applied.
+    """
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("This function requires PyTorch to be installed.") from exc
+
+    if logger is None:
+        logger = logging.getLogger("mixed_precision_quantizer")
+        if not logger.handlers:
+            logger.setLevel(logging.INFO)
+            ch = logging.StreamHandler(sys.stdout)
+            ch.setLevel(logging.INFO)
+            ch.setFormatter(
+                logging.Formatter(
+                    fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            logger.addHandler(ch)
+
+    # ----- Discover quantizable layers -----
+    quantizable_types = (nn.Linear, nn.Conv2d)
+    layer_modules: Dict[str, nn.Module] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, quantizable_types):
+            layer_modules[name] = module
+    if not layer_modules:
+        logger.warning("No quantizable layers (Linear/Conv2d) found. Returning model unchanged.")
+        return model
+
+    # ----- Collect activation outputs via forward hooks -----
+    activation_samples: Dict[str, List[torch.Tensor]] = {name: [] for name in layer_modules}
+
+    def make_hook(key: str):
+        def hook(module, inp, out):  # type: ignore[no-redef]
+            # Store a small CPU sample for entropy estimation
+            with torch.no_grad():
+                try:
+                    out_cpu = out.detach().to("cpu", dtype=torch.float32)
+                    flat = out_cpu.view(-1)
+                    if flat.numel() > 262144:
+                        # Cap per-call sample to limit memory
+                        flat = flat[:262144]
+                    activation_samples[key].append(flat)
+                except Exception:
+                    pass
+        return hook
+
+    handles = []
+    for name, module in layer_modules.items():
+        handles.append(module.register_forward_hook(make_hook(name)))
+
+    was_training = model.training
+    model.eval()
+    batches_seen = 0
+    with torch.no_grad():
+        for batch in calibration_loader:
+            if isinstance(batch, (list, tuple)):
+                inputs = batch[0]
+            elif isinstance(batch, dict):
+                # Try common keys
+                inputs = batch.get("input") or batch.get("inputs") or next(iter(batch.values()))
+            else:
+                inputs = batch
+
+            try:
+                inputs = inputs.to("cpu")
+            except Exception:
+                pass
+
+            try:
+                _ = model(inputs)
+            except Exception as exc:  # noqa: BLE001
+                # If the model forward signature is incompatible, stop calibration early
+                logger.warning("Calibration forward failed on a batch: %s", exc)
+                break
+
+            batches_seen += 1
+            if batches_seen >= max_calib_batches:
+                break
+
+    # Remove hooks
+    for h in handles:
+        try:
+            h.remove()
+        except Exception:
+            pass
+    if was_training:
+        model.train()
+
+    # ----- Entropy-based sensitivity per layer -----
+    def shannon_entropy(values_np: np.ndarray) -> float:
+        if values_np.size == 0:
+            return 0.0
+        abs_vals = np.abs(values_np)
+        vmax = float(abs_vals.max()) if abs_vals.size else 0.0
+        if vmax <= 0.0:
+            return 0.0
+        hist, _ = np.histogram(abs_vals, bins=256, range=(0.0, vmax))
+        total = hist.sum()
+        if total == 0:
+            return 0.0
+        p = hist.astype(np.float64) / float(total)
+        p = p[p > 0]
+        return float(-(p * (np.log(p) / np.log(2.0))).sum())
+
+    layer_entropy_bits: Dict[str, float] = {}
+    for name, samples in activation_samples.items():
+        if not samples:
+            layer_entropy_bits[name] = 0.0
+            continue
+        cat = torch.cat(samples, dim=0)
+        if cat.numel() > 1_000_000:
+            cat = cat[:1_000_000]
+        layer_entropy_bits[name] = shannon_entropy(cat.numpy())
+
+    # ----- Parameter counts and size models -----
+    def module_param_count(mod: nn.Module) -> int:
+        count = 0
+        for p in mod.parameters(recurse=False):
+            count += p.numel()
+        return count
+
+    layer_param_counts: Dict[str, int] = {name: module_param_count(m) for name, m in layer_modules.items()}
+
+    def size_bytes_for_bits(param_count: int, bits: int) -> int:
+        return int(np.ceil(param_count * (bits / 8.0)))
+
+    budget_bytes = int(memory_budget_mb * 1024 * 1024)
+
+    # ----- Greedy allocation: start at 4-bit, upgrade by sensitivity -----
+    layer_bits: Dict[str, int] = {name: 4 for name in layer_modules.keys()}
+
+    def total_size_current() -> int:
+        return sum(size_bytes_for_bits(layer_param_counts[name], layer_bits[name]) for name in layer_bits)
+
+    # Sort layers by entropy descending
+    sorted_layers = sorted(layer_modules.keys(), key=lambda n: layer_entropy_bits.get(n, 0.0), reverse=True)
+
+    improved = True
+    while improved:
+        improved = False
+        for name in sorted_layers:
+            current_b = layer_bits[name]
+            next_b = 8 if current_b == 4 else (16 if current_b == 8 else 16)
+            if current_b == 16:
+                continue
+            cur_total = total_size_current()
+            delta = size_bytes_for_bits(layer_param_counts[name], next_b) - size_bytes_for_bits(layer_param_counts[name], current_b)
+            if cur_total + delta <= budget_bytes:
+                layer_bits[name] = next_b
+                improved = True
+
+        # If nothing changed in a full pass, stop
+
+    total_final = total_size_current()
+    if total_final > budget_bytes:
+        logger.warning(
+            "Budget not met even at minimal 4-bit for all layers. required=%d, budget=%d",
+            total_final,
+            budget_bytes,
+        )
+
+    # ----- Compute per-layer quantization params and wrap modules -----
+    def compute_scale_zero(weight: torch.Tensor, act_samples: List[torch.Tensor], bits: int) -> Tuple[float, int]:
+        eps = 1e-6
+        w_std = float(weight.detach().to("cpu", dtype=torch.float32).std().item())
+        a_std = 0.0
+        if act_samples:
+            cat = torch.cat(act_samples, dim=0)
+            if cat.numel() > 1_000_000:
+                cat = cat[:1_000_000]
+            a_std = float(cat.std().item())
+        std = max(w_std, a_std, eps)
+        if bits >= 16:
+            return 1.0, 0
+        max_q = (1 << (bits - 1)) - 1  # 7 for 4-bit, 127 for 8-bit
+        k_sigma = 3.0
+        scale = float(max_q / (k_sigma * std))
+        return scale, 0
+
+    class MixedPrecisionLinear(nn.Module):
+        def __init__(self, base: nn.Linear, bits: int, scale: float, zero: int):
+            super().__init__()
+            self.bits = int(bits)
+            self.scale = float(scale)
+            self.zero = int(zero)
+            if self.bits >= 16:
+                self.weight_fp = base.weight.detach().to(dtype=torch.float16, device="cpu")
+                self.bias_fp = None if base.bias is None else base.bias.detach().to(dtype=torch.float16, device="cpu")
+            else:
+                w = base.weight.detach().to(dtype=torch.float32, device="cpu")
+                max_q = (1 << (self.bits - 1)) - 1
+                min_q = - (1 << (self.bits - 1))
+                w_q = torch.clamp(torch.round(w * self.scale), min_q, max_q).to(dtype=torch.int8)
+                self.weight_q = w_q
+                self.bias_fp = None if base.bias is None else base.bias.detach().to(dtype=torch.float32, device="cpu")
+            self.in_features = base.in_features
+            self.out_features = base.out_features
+            self.stride = None
+            self.padding = None
+
+        def forward(self, x):  # type: ignore[override]
+            if self.bits >= 16:
+                return F.linear(x, self.weight_fp.to(dtype=x.dtype), None if self.bias_fp is None else self.bias_fp.to(dtype=x.dtype))
+            w = self.weight_q.to(dtype=torch.float32) / self.scale
+            return F.linear(x, w.to(dtype=x.dtype), self.bias_fp.to(dtype=x.dtype) if self.bias_fp is not None else None)
+
+    class MixedPrecisionConv2d(nn.Module):
+        def __init__(self, base: nn.Conv2d, bits: int, scale: float, zero: int):
+            super().__init__()
+            self.bits = int(bits)
+            self.scale = float(scale)
+            self.zero = int(zero)
+            self.stride = base.stride
+            self.padding = base.padding
+            self.dilation = base.dilation
+            self.groups = base.groups
+            self.padding_mode = base.padding_mode
+            if self.bits >= 16:
+                self.weight_fp = base.weight.detach().to(dtype=torch.float16, device="cpu")
+                self.bias_fp = None if base.bias is None else base.bias.detach().to(dtype=torch.float16, device="cpu")
+            else:
+                w = base.weight.detach().to(dtype=torch.float32, device="cpu")
+                max_q = (1 << (self.bits - 1)) - 1
+                min_q = - (1 << (self.bits - 1))
+                w_q = torch.clamp(torch.round(w * self.scale), min_q, max_q).to(dtype=torch.int8)
+                self.weight_q = w_q
+                self.bias_fp = None if base.bias is None else base.bias.detach().to(dtype=torch.float32, device="cpu")
+
+        def forward(self, x):  # type: ignore[override]
+            if self.bits >= 16:
+                return F.conv2d(
+                    x,
+                    self.weight_fp.to(dtype=x.dtype),
+                    None if self.bias_fp is None else self.bias_fp.to(dtype=x.dtype),
+                    stride=self.stride,
+                    padding=self.padding,
+                    dilation=self.dilation,
+                    groups=self.groups,
+                )
+            w = self.weight_q.to(dtype=torch.float32) / self.scale
+            return F.conv2d(
+                x,
+                w.to(dtype=x.dtype),
+                self.bias_fp.to(dtype=x.dtype) if self.bias_fp is not None else None,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+
+    # Helper to set submodule by dotted path
+    def set_submodule(root: nn.Module, path: str, new_mod: nn.Module) -> None:
+        parts = path.split(".")
+        parent = root
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], new_mod)
+
+    # Build and apply wrappers
+    for name, module in layer_modules.items():
+        bits = layer_bits[name]
+        scale, zero = compute_scale_zero(module.weight, activation_samples.get(name, []), bits)
+        if isinstance(module, nn.Linear):
+            wrapped = MixedPrecisionLinear(module, bits, scale, zero)
+        else:
+            wrapped = MixedPrecisionConv2d(module, bits, scale, zero)  # type: ignore[arg-type]
+        set_submodule(model, name, wrapped)
+        logger.info("Layer '%s' assigned %d-bit (scale=%.6f)", name, bits, scale)
+
+    assigned_summary = {name: int(layer_bits[name]) for name in layer_modules}
+    logger.info("Mixed-precision assignment complete. Layers: %s", assigned_summary)
+    return model
+
 def main() -> None:
     quantizer = LongCatQuantizer()
     quantizer.run()
