@@ -5,7 +5,9 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from glob import glob
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 
 @dataclass
@@ -231,24 +233,186 @@ class LongCatQuantizer:
             except OSError as exc:
                 self.logger.error("Failed to delete checkpoint '%s': %s", self.checkpoint_path, exc)
 
-    def load_weights(self, file_path: str) -> None:
-        # Placeholder - replace with actual library calls as needed
-        self.logger.info("[LOAD] Loading FP16 weights from: %s", file_path)
-        self.logger.info("[LOAD] Using MPS device if available (simulated)")
+    def load_weights(self, file_path: str) -> Dict[str, np.ndarray]:
+        """Load weights from a supported file into CPU memory as float32 numpy arrays.
 
-    def quantize_weights(self, file_name: str) -> None:
-        # Placeholder - replace with actual EWQ quantization procedure
-        self.logger.info("[QUANTIZE] Performing EWQ on: %s (simulated)", file_name)
-        self.logger.info("[QUANTIZE] Using entropy-weighted kernels (simulated)")
+        Supports:
+        - .safetensors via safetensors + torch
+        - .pt/.bin via torch.load
+        - .tensors is not supported (raises RuntimeError)
+        """
+        _, ext = os.path.splitext(file_path)
+        ext = ext.lower()
 
-    def save_quantized_file(self, file_name: str, original_weights_bytes: int) -> None:
-        # Placeholder - replace with actual save routine
+        self.logger.info("[LOAD] Loading weights from: %s", file_path)
+
+        try:
+            import torch  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "PyTorch is required to load weight files (.pt/.bin/.safetensors)."
+            ) from exc
+
+        if ext == ".safetensors":
+            try:
+                from safetensors.torch import safe_open  # type: ignore
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "safetensors package is required to load .safetensors files."
+                ) from exc
+
+            tensors: Dict[str, np.ndarray] = {}
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    t = f.get_tensor(key)
+                    if not torch.is_floating_point(t):
+                        # Skip non-floating tensors
+                        continue
+                    tensors[key] = t.detach().to(dtype=torch.float32, device="cpu").numpy()
+            if not tensors:
+                raise RuntimeError("No floating-point tensors found in .safetensors file.")
+            self.logger.info("[LOAD] Loaded %d tensors from .safetensors", len(tensors))
+            return tensors
+
+        if ext in {".pt", ".bin"}:
+            map_location = "cpu"
+            obj = torch.load(file_path, map_location=map_location)
+            # Common patterns: dict of tensors or {'state_dict': ...}
+            if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+                state_dict = obj["state_dict"]
+            elif isinstance(obj, dict):
+                state_dict = obj
+            else:
+                raise RuntimeError("Unsupported .pt/.bin format: expected a dict or state_dict.")
+
+            tensors = {}
+            for name, t in state_dict.items():
+                if hasattr(t, "detach"):
+                    t_cpu = t.detach().to(dtype=torch.float32, device="cpu")
+                    if torch.is_floating_point(t_cpu):
+                        tensors[str(name)] = t_cpu.numpy()
+            if not tensors:
+                raise RuntimeError("No floating-point tensors found in .pt/.bin file.")
+            self.logger.info("[LOAD] Loaded %d tensors from %s", len(tensors), ext)
+            return tensors
+
+        if ext == ".tensors":
+            raise RuntimeError(".tensors format is not supported by this loader.")
+
+        raise RuntimeError(f"Unsupported file extension: {ext}")
+
+    def quantize_weights(
+        self, weights: Dict[str, np.ndarray]
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], Dict[str, float]]:
+        """Quantize weights to int8 using a simple entropy-weighted scaling.
+
+        For each tensor:
+          - compute histogram-based Shannon entropy over 256 bins
+          - normalize entropy to [0, 1]
+          - compute scale = base_scale * (1.0 + 0.5 * entropy_norm)
+          - q = clip(round(x * scale), -128, 127).astype(int8)
+
+        Returns:
+          - q_weights: dict of int8 numpy arrays
+          - scales: dict of float (inverse of dequant step, used as scale)
+          - entropies: dict of entropy bits
+        """
+        q_weights: Dict[str, np.ndarray] = {}
+        scales: Dict[str, float] = {}
+        entropies: Dict[str, float] = {}
+
+        eps = 1e-6
+        for name, arr in weights.items():
+            if arr.dtype.kind not in {"f"}:
+                continue
+            x = arr.astype(np.float32, copy=False)
+
+            # Shannon entropy over magnitude distribution
+            abs_x = np.abs(x.reshape(-1))
+            if abs_x.size == 0:
+                H_bits = 0.0
+            else:
+                counts, _ = np.histogram(abs_x, bins=256, range=(0.0, float(abs_x.max() + eps)))
+                total = counts.sum()
+                if total == 0:
+                    H_bits = 0.0
+                else:
+                    p = counts.astype(np.float64) / float(total)
+                    # avoid log(0)
+                    p = p[p > 0]
+                    H_bits = float(-(p * (np.log(p) / np.log(2.0))).sum())
+
+            entropy_norm = H_bits / np.log2(256.0)  # 0..1
+
+            std = float(np.std(x))
+            std = max(std, eps)
+            base_scale = 127.0 / (3.0 * std)  # cover ~3 sigma
+            scale = float(base_scale * (1.0 + 0.5 * entropy_norm))
+
+            q = np.clip(np.rint(x * scale), -128, 127).astype(np.int8)
+
+            q_weights[name] = q
+            scales[name] = scale
+            entropies[name] = H_bits
+
+            self.logger.info(
+                "[QUANTIZE] %s | std=%.6f, entropy=%.3f bits, scale=%.6f",
+                name,
+                std,
+                H_bits,
+                scale,
+            )
+
+        if not q_weights:
+            raise RuntimeError("No quantizable floating tensors found.")
+
+        self.logger.info("[QUANTIZE] Quantized %d tensors to int8", len(q_weights))
+        return q_weights, scales, entropies
+
+    def save_quantized_file(
+        self,
+        file_path: str,
+        original_weights_bytes: int,
+        q_weights: Dict[str, np.ndarray],
+        scales: Dict[str, float],
+        entropies: Dict[str, float],
+    ) -> None:
+        """Save quantized tensors and metadata.
+
+        Writes:
+          - <original>.ewq.npz: int8 tensors by name
+          - <original>.ewq.meta.json: metadata including scales, entropies, and original size
+        """
+        out_npz = f"{file_path}.ewq.npz"
+        out_meta = f"{file_path}.ewq.meta.json"
+
+        # Save tensors
+        try:
+            np.savez_compressed(out_npz, **q_weights)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to write NPZ file: {out_npz}") from exc
+
+        # Save metadata separately as JSON
+        meta = {
+            "original_file": file_path,
+            "original_size_bytes": int(original_weights_bytes),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "scales": {k: float(v) for k, v in scales.items()},
+            "entropies_bits": {k: float(v) for k, v in entropies.items()},
+            "dtype": "int8",
+            "quantization": "entropy_weighted_symmetric_int8",
+        }
+        try:
+            with open(out_meta, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to write metadata JSON: {out_meta}") from exc
+
         self.logger.info(
-            "[SAVE] Saving quantized artifact for: %s (original size: %d bytes) (simulated)",
-            file_name,
-            original_weights_bytes,
+            "[SAVE] Wrote quantized tensors: %s and metadata: %s",
+            out_npz,
+            out_meta,
         )
-        self.logger.info("[SAVE] Writing to target storage (simulated)")
 
     def run(self) -> None:
         if not self.tasks:
@@ -289,9 +453,15 @@ class LongCatQuantizer:
                 return
 
             try:
-                self.load_weights(task.file_path)
-                self.quantize_weights(task.file_name)
-                self.save_quantized_file(task.file_name, task.size_bytes)
+                weights = self.load_weights(task.file_path)
+                q_weights, scales, entropies = self.quantize_weights(weights)
+                self.save_quantized_file(
+                    task.file_path,
+                    task.size_bytes,
+                    q_weights,
+                    scales,
+                    entropies,
+                )
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(
                     "Task %d failed for file '%s': %s", task.index, task.file_path, exc
