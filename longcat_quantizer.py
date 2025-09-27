@@ -2,6 +2,9 @@ import json
 import logging
 import os
 import sys
+import platform
+import subprocess
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from glob import glob
@@ -58,22 +61,23 @@ class LongCatQuantizer:
 
         memory_gb_env = os.environ.get("QUANTIZE_MEMORY_GB")
         if memory_gb_env is None:
-            self.memory_limit_gb = 192.0
+            # Auto-detect memory budget: macOS -> unified RAM; PC -> GPU VRAM if available, else system RAM
+            self.memory_limit_gb = self._auto_detect_memory_gb() * 0.9
             if not logging.getLogger().handlers:
                 self._bootstrap_basic_logging()
             logging.warning(
-                "ENV QUANTIZE_MEMORY_GB not set. Using default: %.2f GB",
+                "ENV QUANTIZE_MEMORY_GB not set. Auto-selected 90%% of available memory: %.2f GB",
                 self.memory_limit_gb,
             )
         else:
             try:
                 self.memory_limit_gb = float(memory_gb_env)
             except ValueError:
-                self.memory_limit_gb = 192.0
+                self.memory_limit_gb = self._auto_detect_memory_gb() * 0.9
                 if not logging.getLogger().handlers:
                     self._bootstrap_basic_logging()
                 logging.warning(
-                    "ENV QUANTIZE_MEMORY_GB invalid '%s'. Falling back to default: %.2f GB",
+                    "ENV QUANTIZE_MEMORY_GB invalid '%s'. Auto-selected 90%% of available memory: %.2f GB",
                     memory_gb_env,
                     self.memory_limit_gb,
                 )
@@ -95,6 +99,14 @@ class LongCatQuantizer:
         self.logger.info("General Log: %s", self.general_log_path)
         self.logger.info("Error Log: %s", self.error_log_path)
 
+        # Output directories
+        self.model_name = os.path.basename(os.path.normpath(self.model_directory)) or "model"
+        self.output_root_dir = os.path.join(self.cwd, f"{self.model_name}_{self.timestamp}")
+        try:
+            os.makedirs(self.output_root_dir, exist_ok=True)
+        except OSError as exc:
+            self.logger.error("Failed to create output directory '%s': %s", self.output_root_dir, exc)
+
         # 3. Inspect Architecture & build task list
         self.supported_extensions = (".safetensors", ".bin", ".pt", ".tensors")
         self.tasks: List[QuantizationTask] = self._discover_tasks()
@@ -104,6 +116,34 @@ class LongCatQuantizer:
 
         # Checkpointing
         self.checkpoint_path = os.path.join(self.cwd, "quantization_checkpoint.json")
+
+    def _auto_detect_memory_gb(self) -> float:
+        """Detect total memory in GB without external dependencies.
+
+        macOS (Darwin): use total system RAM as unified memory.
+        PC: if CUDA available, use GPU0 VRAM; otherwise system RAM.
+        """
+        total_bytes = 0
+        try:
+            # Prefer CUDA VRAM on non-mac systems
+            import torch  # type: ignore
+            if platform.system() != "Darwin" and torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(0)
+                total_bytes = int(getattr(props, "total_memory", 0))
+        except Exception:
+            pass
+
+        if total_bytes <= 0:
+            # Fallback to system RAM
+            try:
+                pagesize = os.sysconf("SC_PAGE_SIZE")  # bytes
+                phys_pages = os.sysconf("SC_PHYS_PAGES")
+                total_bytes = int(pagesize) * int(phys_pages)
+            except Exception:
+                # Conservative fallback
+                total_bytes = 16 * 1024 * 1024 * 1024
+
+        return float(total_bytes) / (1024**3)
 
     def _bootstrap_basic_logging(self) -> None:
         # Ensure warnings can be emitted before full logging setup
@@ -380,19 +420,39 @@ class LongCatQuantizer:
         """Save quantized tensors and metadata.
 
         Writes:
-          - <original>.ewq.npz: int8 tensors by name
-          - <original>.ewq.meta.json: metadata including scales, entropies, and original size
+          - <output_root>/<relative>/<file>.ewq.safetensors: int8 tensors by name
+          - <output_root>/<relative>/<file>.ewq.meta.json: metadata including scales, entropies, and original size
         """
-        out_npz = f"{file_path}.ewq.npz"
-        out_meta = f"{file_path}.ewq.meta.json"
-
-        # Save tensors
         try:
-            np.savez_compressed(out_npz, **q_weights)
+            import torch  # type: ignore
+            from safetensors.torch import save_file  # type: ignore
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Failed to write NPZ file: {out_npz}") from exc
+            raise RuntimeError(
+                "Saving quantized safetensors requires torch and safetensors to be installed."
+            ) from exc
 
-        # Save metadata separately as JSON
+        rel_path = os.path.relpath(file_path, self.model_directory)
+        rel_dir = os.path.dirname(rel_path)
+        base_name = os.path.basename(file_path)
+        dest_dir = os.path.join(self.output_root_dir, rel_dir)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        out_st = os.path.join(dest_dir, f"{base_name}.ewq.safetensors")
+        out_meta = os.path.join(dest_dir, f"{base_name}.ewq.meta.json")
+
+        # Convert numpy int8 to torch tensors and save as safetensors
+        tensors: Dict[str, torch.Tensor] = {}
+        for k, v in q_weights.items():
+            if not isinstance(v, np.ndarray):
+                raise RuntimeError("q_weights values must be numpy arrays")
+            t = torch.from_numpy(v.astype(np.int8, copy=False))
+            tensors[k] = t
+        try:
+            save_file(tensors, out_st)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to write safetensors file: {out_st}") from exc
+
+        # Save metadata JSON
         meta = {
             "original_file": file_path,
             "original_size_bytes": int(original_weights_bytes),
@@ -408,11 +468,8 @@ class LongCatQuantizer:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Failed to write metadata JSON: {out_meta}") from exc
 
-        self.logger.info(
-            "[SAVE] Wrote quantized tensors: %s and metadata: %s",
-            out_npz,
-            out_meta,
-        )
+        self.logger.info("[SAVE] Wrote quantized safetensors: %s", out_st)
+        self.logger.info("[SAVE] Wrote metadata: %s", out_meta)
 
     def run(self) -> None:
         if not self.tasks:
@@ -475,12 +532,71 @@ class LongCatQuantizer:
         # If we finished all tasks, remove checkpoint
         self._delete_checkpoint()
         self.logger.info("All tasks completed successfully.")
+        # Attempt to package to llama.cpp format
+        try:
+            self._package_to_llamacpp()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Packaging to llama.cpp format failed: %s", exc)
+
+    def _package_to_llamacpp(self) -> None:
+        """Attempt to create llama.cpp-compatible package in GGUF format.
+
+        If env LLAMA_CPP_CONVERTER points to llama.cpp's convert.py, we will try to
+        invoke it. Otherwise, we create a README with instructions.
+        """
+        final_dir = os.path.join(self.cwd, f"final_{self.model_name}_{self.timestamp}")
+        os.makedirs(final_dir, exist_ok=True)
+
+        converter_path = os.environ.get("LLAMA_CPP_CONVERTER")
+        python_exe = sys.executable or "python3"
+
+        if converter_path and os.path.isfile(converter_path):
+            out_file = os.path.join(final_dir, f"{self.model_name}.gguf")
+            cmd = (
+                f"{python_exe} {converter_path} --outfile {out_file} --vocab-dir {self.model_directory} "
+                f"{self.output_root_dir} | cat"
+            )
+            self.logger.info("Attempting llama.cpp conversion via: %s", cmd)
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                self.logger.info("GGUF written to: %s", out_file)
+                return
+            except subprocess.CalledProcessError as exc:
+                self.logger.error("llama.cpp convert.py failed: %s", exc)
+
+        # Fallback: copy safetensors and write README
+        copied = 0
+        for root, _, files in os.walk(self.output_root_dir):
+            for fn in files:
+                if fn.endswith(".safetensors") or fn.endswith(".json"):
+                    src = os.path.join(root, fn)
+                    dst = os.path.join(final_dir, fn)
+                    try:
+                        shutil.copy2(src, dst)
+                        copied += 1
+                    except OSError:
+                        pass
+
+        readme = os.path.join(final_dir, "README_llama_cpp_conversion.txt")
+        with open(readme, "w", encoding="utf-8") as f:
+            f.write(
+                "This directory contains quantized safetensors and metadata.\n"
+                "To convert to GGUF for llama.cpp, clone llama.cpp and run:\n\n"
+                "  python convert.py --outfile ./model.gguf --outtype f16 <path-to-model>\n\n"
+                "Set env LLAMA_CPP_CONVERTER to the absolute path of convert.py to enable\n"
+                "automatic conversion in this pipeline.\n"
+            )
+        self.logger.info(
+            "Packaged %d artifact files to '%s'. See README for GGUF conversion.",
+            copied,
+            final_dir,
+        )
 
 
 def quantize_model_mixed_precision(
     model,
     calibration_loader,
-    memory_budget_mb: float,
+    memory_budget_mb: Optional[float] = None,
     logger: Optional[logging.Logger] = None,
     max_calib_batches: int = 5,
 ) -> "object":
@@ -629,7 +745,31 @@ def quantize_model_mixed_precision(
     def size_bytes_for_bits(param_count: int, bits: int) -> int:
         return int(np.ceil(param_count * (bits / 8.0)))
 
-    budget_bytes = int(memory_budget_mb * 1024 * 1024)
+    # Determine target budget if not provided: macOS 90% unified; PC 90% CUDA VRAM, else 90% system RAM
+    if memory_budget_mb is None:
+        # Reuse internal detector from class (standalone here)
+        def _auto_detect_memory_gb_simple() -> float:
+            total_bytes_local = 0
+            try:
+                if platform.system() != "Darwin" and torch.cuda.is_available():
+                    props_local = torch.cuda.get_device_properties(0)
+                    total_bytes_local = int(getattr(props_local, "total_memory", 0))
+            except Exception:
+                pass
+            if total_bytes_local <= 0:
+                try:
+                    pagesize_local = os.sysconf("SC_PAGE_SIZE")
+                    phys_pages_local = os.sysconf("SC_PHYS_PAGES")
+                    total_bytes_local = int(pagesize_local) * int(phys_pages_local)
+                except Exception:
+                    total_bytes_local = 16 * 1024 * 1024 * 1024
+            return float(total_bytes_local) / (1024**3)
+
+        total_gb = _auto_detect_memory_gb_simple()
+        memory_budget_mb = total_gb * 0.9 * 1024.0
+        logger.info("Auto-selected memory budget: %.2f MB (90%% of available)", memory_budget_mb)
+
+    budget_bytes = int(float(memory_budget_mb) * 1024 * 1024)
 
     # ----- Greedy allocation: start at 4-bit, upgrade by sensitivity -----
     layer_bits: Dict[str, int] = {name: 4 for name in layer_modules.keys()}
